@@ -1,1 +1,1 @@
-// server.js
+// server.js: full server code placeholder

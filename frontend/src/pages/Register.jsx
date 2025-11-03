@@ -1,1 +1,1 @@
-// Register page
+// Register.jsx placeholder

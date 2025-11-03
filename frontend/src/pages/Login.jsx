@@ -1,1 +1,1 @@
-// Login page
+// Login.jsx placeholder
