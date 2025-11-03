@@ -1,0 +1,16 @@
+# Node dependencies
+backend/node_modules/
+frontend/node_modules/
+
+# Logs
+*.log
+
+# Docker volumes
+taxis_data/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build outputs
+frontend/dist/
