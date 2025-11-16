@@ -126,12 +126,99 @@ if (app._router && Array.isArray(app._router.stack)) {
 io.on('connection', (socket) => {
   console.log('🟢 Socket connected:', socket.id);
 
-  socket.on('driver-location', (data) => {
-    socket.broadcast.emit('driver-location-updated', data);
+  // Attach per-socket metadata to track joined geo-grid rooms
+  socket.joinedGrids = new Set();
+
+  // helper: compute a simple grid key based on meters precision
+  function gridKeyFor(lat, lng, meters = 1000) {
+    // approximate degrees per meter (latitude)
+    const degPerMeter = 1 / 111000; // ~1 deg latitude == 111 km
+    const step = meters * degPerMeter;
+    const latIdx = Math.floor(lat / step);
+    const lngIdx = Math.floor(lng / step);
+    return `grid:${meters}:${latIdx}:${lngIdx}`;
+  }
+
+  // Join a set of grid keys (leave previously joined grids not in the new set)
+  function updateJoinedGrids(newKeys = []) {
+    const toJoin = new Set(newKeys);
+    // leave grids no longer needed
+    for (const k of socket.joinedGrids) {
+      if (!toJoin.has(k)) {
+        try { socket.leave(k); } catch (e) {}
+        socket.joinedGrids.delete(k);
+      }
+    }
+    // join new grids
+    for (const k of toJoin) {
+      if (!socket.joinedGrids.has(k)) {
+        try { socket.join(k); socket.joinedGrids.add(k); } catch (e) {}
+      }
+    }
+  }
+
+  // Driver sends location updates. Server auto-manages grid room membership
+  socket.on('driver-location', (data, cb) => {
+    try {
+      const { location } = data || {};
+      if (location && typeof location.lat === 'number' && typeof location.lng === 'number') {
+        const key = gridKeyFor(location.lat, location.lng, 1000);
+        updateJoinedGrids([key]);
+        // Emit to any listeners that driver's location changed (scoped)
+        socket.to(key).emit('driver-location-updated', { socketId: socket.id, location, ts: Date.now() });
+      } else {
+        // broadcast globally as fallback
+        socket.broadcast.emit('driver-location-updated', data);
+      }
+      if (typeof cb === 'function') cb({ ok: true });
+    } catch (err) {
+      if (typeof cb === 'function') cb({ ok: false, error: err.message });
+    }
   });
 
   socket.on('ride-requested', (data) => {
-    socket.broadcast.emit('new-ride-request', data);
+    // When a ride is requested, determine the pickup grid and emit an offer
+    try {
+      const pickup = data && (data.pickup || data.pickupLocation || data.pickupCoords);
+      if (pickup && typeof pickup.lat === 'number' && typeof pickup.lng === 'number') {
+        const key = (function() {
+          const degPerMeter = 1 / 111000;
+          const step = 1000 * degPerMeter;
+          const latIdx = Math.floor(pickup.lat / step);
+          const lngIdx = Math.floor(pickup.lng / step);
+          return `grid:1000:${latIdx}:${lngIdx}`;
+        })();
+        // emit only to drivers subscribed to that grid
+        io.to(key).emit('ride:offer', { ride: data, offerGrid: key });
+      } else {
+        socket.broadcast.emit('new-ride-request', data);
+      }
+    } catch (err) {
+      socket.broadcast.emit('new-ride-request', data);
+    }
+  });
+
+  // Allow drivers to explicitly subscribe to grids (lat/lng + radiusMeters)
+  socket.on('driver:subscribe', (payload, cb) => {
+    try {
+      const { lat, lng, radiusMeters = 1000 } = payload || {};
+      if (typeof lat !== 'number' || typeof lng !== 'number') return cb && cb({ ok: false, error: 'INVALID_LOCATION' });
+      // compute a small set of grid keys covering the radius (simple 3x3 around center)
+      const degPerMeter = 1 / 111000;
+      const step = radiusMeters * degPerMeter;
+      const latIdx = Math.floor(lat / step);
+      const lngIdx = Math.floor(lng / step);
+      const keys = [];
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          keys.push(`grid:${radiusMeters}:${latIdx + dx}:${lngIdx + dy}`);
+        }
+      }
+      updateJoinedGrids(keys);
+      cb && cb({ ok: true, keys });
+    } catch (err) {
+      cb && cb({ ok: false, error: err.message });
+    }
   });
 
   socket.on('ride-accepted', (data) => {
