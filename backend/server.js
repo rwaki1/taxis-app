@@ -129,14 +129,50 @@ io.on('connection', (socket) => {
   // Attach per-socket metadata to track joined geo-grid rooms
   socket.joinedGrids = new Set();
 
-  // helper: compute a simple grid key based on meters precision
+  // Geohash utilities (small implementation) to compute grid keys with precision tuned to radius
+  const BASE32 = '0123456789bcdefghjkmnpqrstuvwxyz';
+
+  function geohashEncode(lat, lon, precision) {
+    let idx = 0;
+    let bit = 0;
+    let even = true;
+    let geohash = '';
+    let latMin = -90, latMax = 90, lonMin = -180, lonMax = 180;
+
+    while (geohash.length < precision) {
+      if (even) {
+        const mid = (lonMin + lonMax) / 2;
+        if (lon > mid) { idx = (idx << 1) + 1; lonMin = mid; } else { idx = (idx << 1) + 0; lonMax = mid; }
+      } else {
+        const mid = (latMin + latMax) / 2;
+        if (lat > mid) { idx = (idx << 1) + 1; latMin = mid; } else { idx = (idx << 1) + 0; latMax = mid; }
+      }
+      even = !even;
+      if (++bit === 5) {
+        geohash += BASE32.charAt(idx);
+        bit = 0;
+        idx = 0;
+      }
+    }
+    return geohash;
+  }
+
+  function precisionForRadius(radiusMeters) {
+    // Map radius (meters) to geohash length (precision). These are approximate buckets.
+    if (radiusMeters >= 1250000) return 2;
+    if (radiusMeters >= 156000) return 3;
+    if (radiusMeters >= 19500) return 4;
+    if (radiusMeters >= 4890) return 5;
+    if (radiusMeters >= 1220) return 6;
+    if (radiusMeters >= 153) return 7;
+    if (radiusMeters >= 38) return 8;
+    return 9;
+  }
+
   function gridKeyFor(lat, lng, meters = 1000) {
-    // approximate degrees per meter (latitude)
-    const degPerMeter = 1 / 111000; // ~1 deg latitude == 111 km
-    const step = meters * degPerMeter;
-    const latIdx = Math.floor(lat / step);
-    const lngIdx = Math.floor(lng / step);
-    return `grid:${meters}:${latIdx}:${lngIdx}`;
+    const prec = precisionForRadius(meters);
+    const hash = geohashEncode(lat, lng, prec);
+    return `geohash:${prec}:${hash}`;
   }
 
   // Join a set of grid keys (leave previously joined grids not in the new set)
@@ -157,14 +193,14 @@ io.on('connection', (socket) => {
     }
   }
 
-  // Driver sends location updates. Server auto-manages grid room membership
+  // Driver sends location updates. Server auto-manages geohash room membership
   socket.on('driver-location', (data, cb) => {
     try {
       const { location } = data || {};
       if (location && typeof location.lat === 'number' && typeof location.lng === 'number') {
         const key = gridKeyFor(location.lat, location.lng, 1000);
         updateJoinedGrids([key]);
-        // Emit to any listeners that driver's location changed (scoped)
+        // Emit to any listeners in this geohash tile that driver's location changed
         socket.to(key).emit('driver-location-updated', { socketId: socket.id, location, ts: Date.now() });
       } else {
         // broadcast globally as fallback
@@ -181,14 +217,8 @@ io.on('connection', (socket) => {
     try {
       const pickup = data && (data.pickup || data.pickupLocation || data.pickupCoords);
       if (pickup && typeof pickup.lat === 'number' && typeof pickup.lng === 'number') {
-        const key = (function() {
-          const degPerMeter = 1 / 111000;
-          const step = 1000 * degPerMeter;
-          const latIdx = Math.floor(pickup.lat / step);
-          const lngIdx = Math.floor(pickup.lng / step);
-          return `grid:1000:${latIdx}:${lngIdx}`;
-        })();
-        // emit only to drivers subscribed to that grid
+        const key = gridKeyFor(pickup.lat, pickup.lng, 1000);
+        // emit only to drivers subscribed to that geohash tile
         io.to(key).emit('ride:offer', { ride: data, offerGrid: key });
       } else {
         socket.broadcast.emit('new-ride-request', data);
@@ -203,15 +233,15 @@ io.on('connection', (socket) => {
     try {
       const { lat, lng, radiusMeters = 1000 } = payload || {};
       if (typeof lat !== 'number' || typeof lng !== 'number') return cb && cb({ ok: false, error: 'INVALID_LOCATION' });
-      // compute a small set of grid keys covering the radius (simple 3x3 around center)
+      // compute a 3x3 set of geohash tiles around the center using degree offsets
       const degPerMeter = 1 / 111000;
-      const step = radiusMeters * degPerMeter;
-      const latIdx = Math.floor(lat / step);
-      const lngIdx = Math.floor(lng / step);
+      const delta = radiusMeters * degPerMeter;
       const keys = [];
       for (let dx = -1; dx <= 1; dx++) {
         for (let dy = -1; dy <= 1; dy++) {
-          keys.push(`grid:${radiusMeters}:${latIdx + dx}:${lngIdx + dy}`);
+          const sampleLat = lat + dx * delta;
+          const sampleLng = lng + dy * delta;
+          keys.push(gridKeyFor(sampleLat, sampleLng, radiusMeters));
         }
       }
       updateJoinedGrids(keys);
